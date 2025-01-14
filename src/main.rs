@@ -7,15 +7,16 @@ use cloudwatchlogs::{Client, Error};
 use futures::stream::StreamExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use signal_hook::consts::signal::SIGINT;
+use signal_hook::consts::signal::{SIGABRT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTRAP};
 use signal_hook_tokio::Signals;
-use std::os::unix::process::ExitStatusExt;
+use std::env::current_dir;
+use std::io::Read;
 use std::process::exit;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 struct LogBuffer {
@@ -76,7 +77,7 @@ impl LogBuffer {
 
 #[derive(Parser)]
 #[command(name = "cloudwatch_output_redirector")]
-#[command(version = "1.0")]
+#[command(version = "v0.1.10-jiw")]
 #[command(author = "Rusty Conover <rusty@conover.me>")]
 #[command(about = "Redirects stdout and stderr to CloudWatch Logs")]
 struct CommandLineArgs {
@@ -93,6 +94,14 @@ struct CommandLineArgs {
         help = "Tag the stream names with [STDOUT] and [STDERR]"
     )]
     tag_stream_names: bool,
+
+    #[arg(
+        short,
+        long,
+        default_value_t = false,
+        help = "Add messages to the log stream with information about the execution"
+    )]
+    info: bool,
 
     #[arg(
         name = "tee",
@@ -119,6 +128,60 @@ fn current_time_in_millis() -> i64 {
         .as_millis() as i64
 }
 
+#[derive(Copy, Clone)]
+enum Tee {
+    DISABLED,
+    STDOUT,
+    STDERR,
+}
+
+struct LogBufferGroup {
+    buffer: Arc<Mutex<LogBuffer>>,
+    prefix: String,
+    active: bool,
+    tee: Tee,
+}
+impl Clone for LogBufferGroup {
+    fn clone(&self) -> LogBufferGroup {
+        return LogBufferGroup {
+            buffer: Arc::clone(&self.buffer),
+            prefix: self.prefix.clone(),
+            active: self.active,
+            tee: self.tee,
+        };
+    }
+}
+impl LogBufferGroup {
+    async fn add(&self, line: String) {
+        if !self.active {
+            return;
+        }
+        let msg = format!("{}{}", self.prefix, line);
+        match self.tee {
+            Tee::STDOUT => {
+                println!("{}", msg);
+            }
+            Tee::STDERR => {
+                eprintln!("{}", msg);
+            }
+            Tee::DISABLED => {}
+        };
+        let log_event = InputLogEvent::builder()
+            .message(msg)
+            .timestamp(current_time_in_millis())
+            .build()
+            .unwrap();
+        let mut buffer = self.buffer.lock().await;
+        buffer.add_event(log_event);
+    }
+    async fn add_stream<T: AsyncRead + Unpin>(&self, reader: BufReader<T>) {
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            self.add(line).await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
@@ -141,7 +204,7 @@ async fn main() -> Result<(), Error> {
 
         if let Err(e) = create_log_group(&client, &args.log_group_name).await {
             if e.to_string().contains("ResourceAlreadyExistsException") {
-                tracing::debug!("Log group already exists");
+                tracing::info!("Log group already exists");
             } else {
                 tracing::error!("Error creating log group: {}", e);
             }
@@ -150,118 +213,17 @@ async fn main() -> Result<(), Error> {
             create_log_stream(&client, &args.log_group_name, &args.log_stream_name).await
         {
             if e.to_string().contains("ResourceAlreadyExistsException") {
-                tracing::debug!("Log stream already exists");
+                tracing::info!("Log stream already exists");
             } else {
                 tracing::error!("Error creating log group: {}", e);
             }
         }
     }
 
-    // Start the subprocess
-    let mut child = match tokio::process::Command::new(&args.command)
-        .args(&args.args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => {
-            println!("Successfully started child process: {}", args.command);
-            // You can now interact with `child`, e.g., read stdout/stderr
-            child
-        }
-        Err(e) => {
-            eprintln!(
-                "Error: Failed to start the child process '{}': {}",
-                args.command, e
-            );
-            exit(1);
-        }
-    };
-
-    let mut signals = Signals::new(&[SIGINT]).expect("Failed to set up signal handler");
-
-    let child_pid = child.id().expect("Failed to get child PID") as i32;
-
-    let signal_task = tokio::spawn(async move {
-        while let Some(signal) = signals.next().await {
-            if signal == SIGINT {
-                println!(
-                    "Parent received SIGINT. Forwarding to child (PID: {}).",
-                    child_pid
-                );
-                // Forward SIGINT to the child process
-                let _ = kill(Pid::from_raw(child_pid), Signal::SIGINT);
-            }
-        }
-    });
-
-    // Create a buffer for the output streams
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-
-    let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
-
     let exit_indicator = Arc::new(Mutex::new(false));
-
-    // Stream stdout
-    let stdout_buffer = Arc::clone(&log_buffer);
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = stdout_reader.lines();
-        while let Some(line) = lines.next_line().await.unwrap() {
-            let m = if args.tag_stream_names {
-                format!("[STDOUT] {}", line)
-            } else {
-                line.clone()
-            };
-            let log_event = InputLogEvent::builder()
-                .message(m)
-                .timestamp(current_time_in_millis())
-                .build()
-                .unwrap();
-
-            if args.tee {
-                println!("{}", line);
-            }
-
-            {
-                let mut buffer = stdout_buffer.lock().await;
-                buffer.add_event(log_event);
-            }
-        }
-    });
-
-    let stderr_buffer = Arc::clone(&log_buffer);
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = stderr_reader.lines();
-        while let Some(line) = lines.next_line().await.unwrap() {
-            let m = if args.tag_stream_names {
-                format!("[STDERR] {}", line)
-            } else {
-                line.clone()
-            };
-
-            let log_event = InputLogEvent::builder()
-                .message(m)
-                .timestamp(current_time_in_millis())
-                .build()
-                .unwrap();
-
-            if args.tee {
-                eprintln!("{}", line);
-            }
-
-            {
-                let mut buffer = stderr_buffer.lock().await;
-                buffer.add_event(log_event);
-            }
-        }
-    });
-
-    let flush_buffer = Arc::clone(&log_buffer);
     let exit_flag_handle = Arc::clone(&exit_indicator);
+    let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
+    let flush_buffer = Arc::clone(&log_buffer);
     let flush_handle = tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(250));
         let client = Client::new(&config);
@@ -281,7 +243,7 @@ async fn main() -> Result<(), Error> {
                 tracing::trace!("Nothing to flush");
                 let exit = exit_flag_handle.lock().await;
                 if *exit {
-                    tracing::debug!("Exiting flush loop due to flag being set");
+                    tracing::info!("Exiting flush loop due to flag being set");
                     break;
                 }
                 skip_sleep = false;
@@ -292,7 +254,7 @@ async fn main() -> Result<(), Error> {
                 skip_sleep = true;
             }
 
-            tracing::debug!("Flushing {} log events", messages.len());
+            tracing::info!("Flushing {} log events", messages.len());
             let result = client
                 .put_log_events()
                 .log_group_name(&args.log_group_name)
@@ -302,9 +264,12 @@ async fn main() -> Result<(), Error> {
                 .await;
             match result {
                 Ok(put_result) => {
-                    if put_result.rejected_log_events_info.is_some() {
-                        tracing::warn!("Some log events were rejected");
-                    }
+                    match put_result.rejected_log_events_info {
+                        Some(rejected) => {
+                            tracing::warn!("Some log events were rejected: {:?}", rejected)
+                        }
+                        None => tracing::info!("Flushed events"),
+                    };
                 }
                 Err(e) => {
                     tracing::error!("Failed to flush log events: {}", e);
@@ -312,39 +277,27 @@ async fn main() -> Result<(), Error> {
             }
         }
     });
-
-    // Wait for the child process to finish
-    let child_status = child.wait().await;
-    match &child_status {
-        Ok(exit_status) => {
-            if let Some(signal) = exit_status.signal() {
-                tracing::debug!("Process was terminated by signal: {}", signal);
-            } else {
-                tracing::debug!("Process finished with exit status: {}", exit_status);
-            }
-        }
+    let info_buffer = LogBufferGroup {
+        buffer: Arc::clone(&log_buffer),
+        prefix: "[INFO] ".to_string(),
+        active: args.info,
+        tee: match args.tee {
+            true => Tee::STDERR,
+            false => Tee::DISABLED,
+        },
+    };
+    let status = match start(log_buffer, info_buffer.clone()).await {
+        Ok(status) => status,
         Err(e) => {
-            tracing::error!("Failed to wait for child process: {}", e);
+            info_buffer
+                .add(format!("[ERROR] Process exited unexpectedly: {}", e))
+                .await;
+            -1
         }
-    }
-
-    signal_task.abort();
-
-    match stdout_task.await {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("Failed to read stdout: {}", e);
-        }
-    }
-    match stderr_task.await {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("Failed to read stderr: {}", e);
-        }
-    }
+    };
 
     // Set the exit indicator to true
-    tracing::debug!("Setting exit indicator so final messages are flushed.");
+    tracing::info!("Setting exit indicator so final messages are flushed.");
     {
         let mut exit = exit_indicator.lock().await;
         *exit = true;
@@ -356,12 +309,282 @@ async fn main() -> Result<(), Error> {
         tracing::error!("Failed to flush log events: {}", e);
     }
 
-    if let Ok(exit_status) = &child_status {
-        // Exit with the same status code as the child process
-        exit(exit_status.code().unwrap());
-    }
+    tracing::info!("Finished");
+    exit(status);
+}
 
-    Ok(())
+async fn start(
+    log_buffer: Arc<Mutex<LogBuffer>>,
+    info_buffer: LogBufferGroup,
+) -> Result<i32, std::io::Error> {
+    let args = CommandLineArgs::parse();
+    info_buffer
+        .add(format!(
+            "Starting (pwd={:?}): {}{}",
+            current_dir().unwrap(),
+            args.command,
+            args.args.join(" ")
+        ))
+        .await;
+    let mut child = match tokio::process::Command::new(&args.command)
+        .args(&args.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return Err(e),
+    };
+
+    let child_pid = child.id();
+    info_buffer
+        .add(match child_pid {
+            Some(pid) => format!("Successfully started. pid={}", pid),
+            None => "[WARNING] Successfully started, but cant identify pid!".to_string(),
+        })
+        .await;
+    let signal_buffer = info_buffer.clone();
+    let mut signals = Signals::new(&[SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTRAP, SIGABRT])?;
+    let signals_handle = signals.handle();
+    let signal_task = tokio::spawn(async move {
+        while let Some(signal) = signals.next().await {
+            match child_pid {
+                Some(pid) => {
+                    signal_buffer
+                        .add(format!(
+                            "Parent received signal {}, forwarding to child (pid={}).",
+                            signal, pid
+                        ))
+                        .await;
+
+                    match Signal::try_from(signal) {
+                        Ok(signal) => {
+                            // Forward SIGINT to the child process
+                            let _ = kill(Pid::from_raw(pid as i32), signal);
+                        }
+                        Err(_) => {
+                            signal_buffer
+                                .add(format!(
+                                    "[WARNING] Can not convert signal={} to killsignal",
+                                    signal
+                                ))
+                                .await
+                        }
+                    }
+                }
+                None => {
+                    signal_buffer
+                        .add(format!(
+                            "[WARNING] Parent received signal {} but can't forward without pid.",
+                            signal
+                        ))
+                        .await;
+                }
+            }
+        }
+    });
+
+    // Stream stdout
+    let stdout_log = LogBufferGroup {
+        active: true,
+        buffer: Arc::clone(&log_buffer),
+        prefix: match args.tag_stream_names {
+            true => "[STDOUT] ".to_string(),
+            false => "".to_string(),
+        },
+        tee: match args.tee {
+            true => Tee::STDOUT,
+            false => Tee::DISABLED,
+        },
+    };
+    let stdout_reader = child.stdout.take().map(|stream| BufReader::new(stream));
+    let stdout_info = info_buffer.clone();
+    let stdout_task = tokio::spawn(async move {
+        match stdout_reader {
+            Some(reader) => stdout_log.add_stream(reader).await,
+            None => {
+                stdout_info
+                    .add("[WARNING] Can not process stderr.".to_string())
+                    .await
+            }
+        }
+    });
+    let stderr_log = LogBufferGroup {
+        active: true,
+        buffer: Arc::clone(&log_buffer),
+        prefix: match args.tag_stream_names {
+            true => "[STDERR] ".to_string(),
+            false => "".to_string(),
+        },
+        tee: match args.tee {
+            true => Tee::STDERR,
+            false => Tee::DISABLED,
+        },
+    };
+    let stderr_reader = child.stderr.take().map(|stream| BufReader::new(stream));
+    let stderr_info = info_buffer.clone();
+    let stderr_task = tokio::spawn(async move {
+        match stderr_reader {
+            Some(reader) => stderr_log.add_stream(reader).await,
+            None => {
+                stderr_info
+                    .add("[WARNING] Can not process stderr.".to_string())
+                    .await
+            }
+        }
+    });
+    let exit_indicator = Arc::new(Mutex::new(false));
+    let exit_flag_handle = Arc::clone(&exit_indicator);
+    let stdin_writer = child.stdin.take().map(|stream| BufWriter::new(stream));
+    let stdin_info = info_buffer.clone();
+    let mut stdin = std::io::stdin();
+    let stdin_task = tokio::spawn(async move {
+        match stdin_writer {
+            Some(mut writer) => {
+                let mut buf = [0; 1024];
+                loop {
+                    {
+                        let exit = exit_flag_handle.lock().await;
+                        if *exit {
+                            break;
+                        }
+                    }
+                    match stdin.read(&mut buf) {
+                        Ok(size) => {
+                            if size == 0 {
+                                match writer.flush().await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        stdin_info
+                                            .add(format!(
+                                                "[WARNING] Error while flushing writer: {:?}",
+                                                e
+                                            ))
+                                            .await
+                                    }
+                                };
+                            } else {
+                                let last = buf[size - 1]; // Without reading the last buffer item, it will not flush correctly?!
+                                let slice = &mut buf[..size];
+                                match writer.write(slice).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        stdin_info
+                                            .add(format!(
+                                                "[WARNING] Error while forwarding stdin: {:?}",
+                                                e
+                                            ))
+                                            .await
+                                    }
+                                }
+                                if last == 10 {
+                                    stdin_info.add("Stdin closed.".to_string()).await;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            stdin_info
+                                .add(format!("[WARNING] Erro while reading from stdin: {:?}", e))
+                                .await
+                        }
+                    }
+                }
+                match writer.flush().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        stdin_info
+                            .add(format!("[WARNING] Error while flushing writer: {:?}", e))
+                            .await
+                    }
+                };
+                drop(stdin);
+            }
+            None => {
+                stdin_info
+                    .add("[WARNING] Can not process stdin.".to_string())
+                    .await
+            }
+        }
+    });
+
+    match stdout_task.await {
+        Ok(_) => {}
+        Err(e) => {
+            info_buffer
+                .add(format!("[WARNING] Failed to read stdout: {}", e))
+                .await;
+        }
+    }
+    match stderr_task.await {
+        Ok(_) => {}
+        Err(e) => {
+            info_buffer
+                .add(format!("[WARNING] Failed to read stderr: {}", e))
+                .await;
+        }
+    }
+    let status = match child.wait().await {
+        Ok(status) => {
+            let code = status.code().map_or(-1, |code| code);
+            info_buffer
+                .add(format!(
+                    "Finished process with (status={:?}, success={})",
+                    code,
+                    status.success()
+                ))
+                .await;
+            code
+        }
+        Err(e) => {
+            info_buffer
+                .add(format!(
+                    "[ERROR] Error while waiting for process to finish: {}",
+                    e
+                ))
+                .await;
+            -1
+        }
+    };
+    signals_handle.close();
+    match signal_task.await {
+        Ok(_) => {}
+        Err(e) => {
+            info_buffer
+                .add(format!(
+                    "[ERROR] Error while waiting for signals task: {}",
+                    e
+                ))
+                .await;
+        }
+    };
+    tracing::info!("Setting exit indicator so stdin is stopped.");
+    {
+        let mut exit = exit_indicator.lock().await;
+        *exit = true;
+    }
+    match child.stdin {
+        Some(mut stdin) => {
+            tracing::info!("Shutting down stdin");
+            let _ = stdin.shutdown().await;
+        }
+        None => {
+            tracing::info!("Dont need to shutdown stdin");
+        }
+    }
+    stdin_task.abort();
+    match stdin_task.await {
+        Ok(_) => {}
+        Err(e) => {
+            if !e.is_cancelled() {
+                info_buffer
+                    .add(format!("[WARNING] Fail to process stdin: {:?}", e))
+                    .await;
+            }
+        }
+    }
+    Ok(status)
 }
 
 // Function to create a CloudWatch log group

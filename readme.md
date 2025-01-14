@@ -72,3 +72,10 @@ cloudwatch-log-redirector --help
 
 to view the available options and usage instructions.
 
+## Building binaries
+
+We recommend to use [`cross`](https://github.com/cross-rs/cross) to build for different platforms.
+
+```sh
+cross build --release --target x86_64-unknown-linux-gnu
+```
